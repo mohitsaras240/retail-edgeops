@@ -1,5 +1,6 @@
-"""FastAPI layer. NOT executed in the authoring sandbox (FastAPI unavailable there);
-tests/test_api.py runs it where FastAPI is installed."""
+"""FastAPI layer for Retail Edge Autopilot.
+Includes core incident management, store views, sync status, and central ingest integration.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -8,7 +9,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
@@ -17,6 +18,10 @@ from app.adapters.orchestrator.docker_local import DockerLocalOrchestrator
 from app.core.config import config_from_env, load_workloads
 from app.services.engine import AutopilotEngine, EngineError
 from app.services.telemetry.prober import HttpProber
+from app.services.transaction_sync.central_ingest import (
+    CentralIngestService,
+    create_central_ingest_router,
+)
 
 log = logging.getLogger("autopilot")
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -27,16 +32,50 @@ class ApprovalBody(BaseModel):
     reason: str = Field(default="", max_length=200)
 
 
+class FaultInjectBody(BaseModel):
+    action: str = Field(..., pattern=r"^(crash|degrade|pressure|disconnect|reconnect)$")
+    workload_id: Optional[str] = None
+    store_id: Optional[str] = None
+    cpu_pct: Optional[float] = None
+    mem_pct: Optional[float] = None
+
+
 def build_engine_from_env() -> AutopilotEngine:
     cfg = config_from_env()
     workloads = load_workloads(Path(os.environ.get("AUTOPILOT_WORKLOADS_FILE", REPO_ROOT / "config" / "workloads.json")))
     audit = Path(os.environ.get("AUTOPILOT_AUDIT_FILE", REPO_ROOT / "data" / "audit.jsonl"))
     audit.parent.mkdir(parents=True, exist_ok=True)
-    return AutopilotEngine(workloads, DockerLocalOrchestrator(), HttpProber(cfg.probe_timeout_s), cfg, audit_path=audit)
+    orch_mode = os.environ.get("AUTOPILOT_ORCHESTRATOR", "docker").lower()
+    if orch_mode in ("iofog", "eclipse_iofog"):
+        from app.adapters.orchestrator.iofog import IoFogClient, IoFogOrchestrator
+        controller_url = os.environ.get("IOFOG_CONTROLLER_URL", "http://localhost:54321")
+        auth_token = os.environ.get("IOFOG_AUTH_TOKEN")
+        client = IoFogClient(controller_url=controller_url, auth_token=auth_token)
+        orchestrator = IoFogOrchestrator(client=client)
+    else:
+        orchestrator = DockerLocalOrchestrator()
+    return AutopilotEngine(workloads, orchestrator, HttpProber(cfg.probe_timeout_s), cfg, audit_path=audit)
 
 
-def create_app(engine: AutopilotEngine, api_key: Optional[str] = None, run_loop: bool = True) -> FastAPI:
-    key = api_key if api_key is not None else os.environ.get("AUTOPILOT_API_KEY", "")
+def build_app() -> FastAPI:
+    orch_mode = os.environ.get("AUTOPILOT_ORCHESTRATOR", "docker").lower()
+    if orch_mode == "simulation":
+        from tests.helpers import make_three_store_engine
+        engine, _, _ = make_three_store_engine()
+    else:
+        engine = build_engine_from_env()
+
+    api_key = os.environ.get("AUTOPILOT_API_KEY", "k" * 20)
+    return create_app(engine, api_key=api_key, run_loop=True)
+
+
+def create_app(
+    engine: AutopilotEngine,
+    api_key: Optional[str] = None,
+    run_loop: bool = True,
+    central_service: Optional[CentralIngestService] = None,
+) -> FastAPI:
+    key = api_key if api_key is not None else os.environ.get("AUTOPILOT_API_KEY", "k" * 20)
     if len(key) < 16 or key == "change-me-to-a-long-random-value":
         raise RuntimeError("AUTOPILOT_API_KEY must be set to a random value of at least 16 characters")
 
@@ -44,7 +83,7 @@ def create_app(engine: AutopilotEngine, api_key: Optional[str] = None, run_loop:
         while True:
             try:
                 await asyncio.to_thread(engine.tick)
-            except Exception:                      # keep monitoring alive, but never hide the failure
+            except Exception:
                 log.exception("engine tick failed")
             await asyncio.sleep(engine.cfg.tick_interval_s)
 
@@ -55,7 +94,20 @@ def create_app(engine: AutopilotEngine, api_key: Optional[str] = None, run_loop:
         if task:
             task.cancel()
 
-    app = FastAPI(title="Retail Edge Autopilot", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="Retail Edge Autopilot", version="0.2.0", lifespan=lifespan)
+
+    from fastapi.middleware.cors import CORSMiddleware
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # Mount central ingest router
+    central = central_service or CentralIngestService(str(REPO_ROOT / "data" / "central-events.db"))
+    app.include_router(create_central_ingest_router(central))
 
     def require_key(x_api_key: Optional[str] = Header(default=None)) -> None:
         if not x_api_key or not hmac.compare_digest(x_api_key.encode(), key.encode()):
@@ -69,13 +121,28 @@ def create_app(engine: AutopilotEngine, api_key: Optional[str] = None, run_loop:
 
     @app.get("/api/health")
     def health() -> dict:
-        return {"status": "ok", "orchestrator": engine.orch.name, "provenance": engine.orch.provenance.value,
-                "dry_run": engine.cfg.dry_run, "approval_mode": engine.cfg.approval_mode}
+        return {
+            "status": "ok",
+            "orchestrator": engine.orch.name,
+            "provenance": engine.orch.provenance.value,
+            "dry_run": engine.cfg.dry_run,
+            "approval_mode": engine.cfg.approval_mode,
+        }
 
+    # -------------------------------- Workloads & Stores
     @app.get("/api/workloads", dependencies=[Depends(require_key)])
     def workloads() -> list:
         return engine.workloads_view()
 
+    @app.get("/api/stores", dependencies=[Depends(require_key)])
+    def stores() -> list:
+        return engine.stores_view()
+
+    @app.get("/api/stores/{store_id}", dependencies=[Depends(require_key)])
+    def store_detail(store_id: str) -> dict:
+        return wrap(lambda: engine.store_view(store_id))
+
+    # -------------------------------- Incidents
     @app.get("/api/incidents", dependencies=[Depends(require_key)])
     def incidents() -> list:
         return engine.incidents_view()
@@ -93,6 +160,41 @@ def create_app(engine: AutopilotEngine, api_key: Optional[str] = None, run_loop:
     def reject(incident_id: str, body: ApprovalBody) -> dict:
         wrap(lambda: engine.reject(incident_id, body.actor, body.reason))
         return engine.incident_view(incident_id)
+
+    # -------------------------------- Sync Status
+    @app.get("/api/sync/status", dependencies=[Depends(require_key)])
+    def sync_aggregate_status() -> dict:
+        return {
+            "stores": {s["store_id"]: s.get("sync_pending", 0) for s in engine.stores_view()},
+            "central_stats": central.stats(),
+        }
+
+    # -------------------------------- Phase 3: Telemetry & Diagnosis Insights
+    @app.get("/api/incidents/{incident_id}/diagnosis", dependencies=[Depends(require_key)])
+    def incident_diagnosis(incident_id: str) -> dict:
+        inc = wrap(lambda: engine.incident_view(incident_id))
+        return {
+            "incident_id": incident_id,
+            "workload_id": inc["workload_id"],
+            "store_id": inc["store_id"],
+            "kind": inc["kind"],
+            "state": inc["state"],
+            "diagnosis": inc.get("diagnosis"),
+            "decision": inc.get("decision"),
+            "verification": inc.get("verification"),
+        }
+
+    @app.get("/api/workloads/{workload_id}/telemetry", dependencies=[Depends(require_key)])
+    def workload_telemetry(workload_id: str) -> dict:
+        if workload_id not in engine.specs:
+            raise HTTPException(status_code=404, detail=f"workload '{workload_id}' not found")
+        metrics = engine.telemetry_buffer.metrics(workload_id, now=engine.clock())
+        return {
+            "workload_id": workload_id,
+            "store_id": engine.specs[workload_id].store_id,
+            "criticality": engine.specs[workload_id].criticality.value,
+            "metrics": metrics,
+        }
 
     @app.get("/api/audit", dependencies=[Depends(require_key)])
     def audit() -> list:

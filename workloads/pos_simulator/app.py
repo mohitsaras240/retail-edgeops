@@ -108,8 +108,10 @@ def make_server(state: PosState, host: str = "127.0.0.1", port: int = 0) -> Thre
                     return self._send(400, {"error": "validation failed"})
                 return self._send(*state.add_transaction(terminal, items, canary))
             if self.path in ("/_fault/degrade", "/_fault/clear") and state.enable_fault_endpoints:
+                self._body()
                 state.degraded = self.path.endswith("degrade")
                 return self._send(200, {"degraded": state.degraded})
+            self._body()
             self._send(404, {"error": "not found"})
 
     return ThreadingHTTPServer((host, port), Handler)

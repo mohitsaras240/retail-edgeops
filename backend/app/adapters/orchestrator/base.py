@@ -35,6 +35,12 @@ class WorkloadStatus:
     started_at: Optional[str] = None
     image: Optional[str] = None
     error: Optional[str] = None        # set when the orchestrator itself could not be queried
+    # Phase 2: extended telemetry fields
+    restart_count: int = 0             # container restart count (cumulative)
+    cpu_pct: Optional[float] = None    # CPU utilisation % (may be stale by up to 10 s)
+    mem_pct: Optional[float] = None    # memory utilisation % (may be stale by up to 10 s)
+    image_version: Optional[str] = None  # image tag / digest fragment (e.g. "sha256:abc123")
+    stats_age_s: Optional[float] = None  # seconds since stats were last refreshed
 
 
 class Orchestrator(ABC):
@@ -52,3 +58,7 @@ class Orchestrator(ABC):
 
     def rollback_workload(self, workload_id: str) -> ActionResult:
         return ActionResult(OpStatus.UNSUPPORTED, f"{self.name}: rollback is not implemented", self.provenance)
+
+    def pause_workload(self, workload_id: str) -> ActionResult:
+        """Pause / suspend a workload. Returns UNSUPPORTED unless the adapter implements it."""
+        return ActionResult(OpStatus.UNSUPPORTED, f"{self.name}: pause is not implemented", self.provenance)

@@ -70,6 +70,15 @@ class PolicyTests(unittest.TestCase):
     def test_stateful_workload_not_auto_restarted(self):
         self.assertEqual(self.d(status(exit_code=137), stateless=False).action, "escalate")
 
+    def test_dependency_unavailable_escalates_without_restarting(self):
+        sp = spec("pos-a", "s0")
+        st = status(running=True)
+        # Diagnosis reports dependency unavailable
+        diag = {"ranked_causes": [{"cause": "dependency_unavailable", "score": 90}], "method": "rule_based_v2"}
+        dec = decide(inc(), sp, st, diag, self.cfg)
+        self.assertEqual(dec.action, "escalate")
+        self.assertIn("dependency unavailable", dec.reason)
+
 
 class ExecutorTests(unittest.TestCase):
     def setUp(self):
@@ -119,6 +128,20 @@ class ExecutorTests(unittest.TestCase):
         rec = self.ex.execute(inc(), self.dec(), self.sp, 1.0)
         self.assertEqual(rec.status, "SKIPPED_ALREADY_HEALTHY")
         self.assertEqual(self.sim.restart_calls, [])
+
+    def test_defer_workload_pauses_workload(self):
+        rec = self.ex.execute(inc(), self.dec("defer_workload"), self.sp, 1.0)
+        self.assertEqual(rec.status, "EXECUTED")
+        self.assertEqual(self.sim.pause_calls, ["pos-a"])
+        self.assertTrue(self.sim.workloads["pos-a"].paused)
+
+    def test_rollback_reports_unsupported_on_docker_local(self):
+        from app.adapters.orchestrator.docker_local import DockerLocalOrchestrator
+        orch = DockerLocalOrchestrator(runner=lambda args, t: (0, "", ""))
+        ex = RecoveryExecutor(orch, self.audit, self.cfg)
+        rec = ex.execute(inc(), self.dec("rollback_workload"), self.sp, 1.0)
+        self.assertEqual(rec.status, "REJECTED")
+        self.assertIn("unsupported by orchestrator", rec.detail)
 
 
 if __name__ == "__main__":

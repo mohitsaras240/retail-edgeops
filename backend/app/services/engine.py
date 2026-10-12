@@ -1,4 +1,11 @@
-"""Closed-loop engine: Observe -> Detect -> Diagnose -> Decide -> Recover -> Verify."""
+"""Closed-loop engine: Observe → Detect → Diagnose → Decide → Recover → Verify.
+
+Phase 2 additions:
+- Multi-workload-kind support (pos / kiosk / sync)
+- sync_pending passed to detector for backlog detection
+- dependency_health passed to diagnosis (same-store workload health map)
+- Store-level view aggregation
+"""
 from __future__ import annotations
 
 import threading
@@ -16,6 +23,7 @@ from app.services.recovery_executor.audit import AuditLog
 from app.services.recovery_executor.executor import RecoveryExecutor
 from app.services.recovery_policy.policy import PolicyDecision, decide
 from app.services.telemetry.prober import Prober
+from app.services.telemetry.rolling_buffer import RollingTelemetryBuffer
 from app.services.verification.verifier import Verifier
 
 
@@ -40,11 +48,24 @@ class AutopilotEngine:
         self.last_samples: dict[str, Sample] = {}
         self.monitoring_errors: dict[str, str] = {}
         self._decisions: dict[str, PolicyDecision] = {}
-        # workload_id -> escalated incident id; suppresses duplicate incidents until the fault clears
+        # workload_id → escalated incident id; suppresses duplicate incidents until fault clears
         self._blocked: dict[str, str] = {}
         self._verify_samples: dict[str, list[Sample]] = {}
         self._verify_since: dict[str, float] = {}
         self._lock = threading.RLock()
+
+        # Phase 2: sync state per store (store_id → pending count reported by sync workload)
+        self._sync_pending: dict[str, int] = {}
+
+        # Phase 3: Rolling window telemetry buffer for statistical anomalies
+        self.telemetry_buffer = RollingTelemetryBuffer(window_seconds=300.0)
+
+    # ---------------------------------------------------------------- public sync API
+    def report_sync_status(self, store_id: str, pending: int) -> None:
+        """Called by the transaction sync subsystem to report pending event counts.
+        Thread-safe; used by the sync backlog detector."""
+        with self._lock:
+            self._sync_pending[store_id] = pending
 
     # ---------------------------------------------------------------- tick
     def tick(self) -> None:
@@ -54,7 +75,10 @@ class AutopilotEngine:
             for spec in self.specs.values():
                 sample = self._collect(spec, now, spec.id in verifying)
                 self.last_samples[spec.id] = sample
-                self._detect(spec, sample, now)
+                # Phase 2: pass sync_pending for the store if this is a sync workload
+                sync_pending = (self._sync_pending.get(spec.store_id)
+                                if spec.kind == "sync" else None)
+                self._detect(spec, sample, now, sync_pending=sync_pending)
             for inc in [i for i in self.incidents.values() if i.is_open]:
                 self._advance(inc, now)
 
@@ -65,21 +89,31 @@ class AutopilotEngine:
             health = self.prober.probe_health(spec)
             if want_canary:
                 canary = self.prober.probe_canary(spec)
+        # Phase 3: record telemetry into rolling buffer
+        self.telemetry_buffer.record(
+            workload_id=spec.id,
+            ts=now,
+            latency_ms=health.latency_ms if health else None,
+            status_code=health.status_code if health else None,
+            ok=health.ok if health else False,
+            cpu_pct=status.cpu_pct,
+            mem_pct=status.mem_pct,
+        )
         return Sample(ts=now, status=status, health=health, canary=canary)
 
     def _open_for(self, workload_id: str) -> Optional[Incident]:
         return next((i for i in self.incidents.values() if i.workload_id == workload_id and i.is_open), None)
 
-    def _detect(self, spec: WorkloadSpec, sample: Sample, now: float) -> None:
+    def _detect(self, spec: WorkloadSpec, sample: Sample, now: float,
+                sync_pending: Optional[int] = None) -> None:
         if sample.status.error:
             self.monitoring_errors[spec.id] = sample.status.error
             return
         self.monitoring_errors.pop(spec.id, None)
         if not self.detector.would_trigger(spec, sample.status, sample.health):
-            self._blocked.pop(spec.id, None)             # workload is healthy again: re-arm detection
-        det = self.detector.evaluate(spec, sample.status, sample.health)
-        # Dedup: one open incident per workload (a restarting service must not spawn new incidents),
-        # and an escalated incident keeps suppressing duplicates until the workload is healthy again.
+            self._blocked.pop(spec.id, None)
+        det = self.detector.evaluate(spec, sample.status, sample.health,
+                                     sync_pending=sync_pending, now=now)
         if det is None or self._open_for(spec.id) or spec.id in self._blocked:
             return
         prior = [i for i in self.incidents.values() if i.workload_id == spec.id and i.kind == det.kind
@@ -106,9 +140,20 @@ class AutopilotEngine:
 
     def _plan(self, inc: Incident, spec: WorkloadSpec, now: float) -> None:
         sample = self.last_samples[spec.id]
-        inc.approved_by = None            # approval is per decision, never carried over to a new one
+        inc.approved_by = None
         logs = self.orch.get_logs(spec.id, 50) if sample.status.found else None
-        inc.diagnosis = diagnose(inc, sample.status, sample.health, logs.detail if logs else "")
+        # Phase 2: build dependency_health map for same-store workloads
+        dep_health = self._dependency_health(spec, inc.workload_id)
+        # Phase 3: compute rolling telemetry metrics
+        tel_metrics = self.telemetry_buffer.metrics(spec.id, now=now)
+        inc.diagnosis = diagnose(
+            inc,
+            sample.status,
+            sample.health,
+            logs.detail if logs else "",
+            dependency_health=dep_health,
+            telemetry_metrics=tel_metrics,
+        )
         decision = decide(inc, spec, sample.status, inc.diagnosis, self.cfg)
         self._decisions[inc.id] = decision
         inc.decision = asdict(decision)
@@ -116,11 +161,25 @@ class AutopilotEngine:
         if decision.action == "escalate":
             self._escalate(inc, now, decision.reason)
         elif decision.requires_approval:
-            inc.transition(S.AWAITING_APPROVAL, now, "restart needs human approval")
+            inc.transition(S.AWAITING_APPROVAL, now, "action needs human approval")
         else:
             inc.approved_by = inc.approved_by or "policy:auto"
             inc.transition(S.RECOVERING, now, decision.reason)
             self._attempt(inc, spec, now)
+
+    def _dependency_health(self, spec: WorkloadSpec, exclude_id: str) -> dict[str, bool]:
+        """Return health map for all same-store workloads except the incident workload."""
+        result = {}
+        for other_spec in self.specs.values():
+            if other_spec.store_id != spec.store_id or other_spec.id == exclude_id:
+                continue
+            s = self.last_samples.get(other_spec.id)
+            if s is None:
+                continue
+            healthy = (s.status.error is None and s.status.found and s.status.running
+                       and (s.health is None or s.health.ok))
+            result[other_spec.id] = healthy
+        return result
 
     def _attempt(self, inc: Incident, spec: WorkloadSpec, now: float) -> None:
         rec = self.executor.execute(inc, self._decisions[inc.id], spec, now)
@@ -132,7 +191,7 @@ class AutopilotEngine:
         elif rec.status == "DRY_RUN":
             self._escalate(inc, now, "dry-run mode: no action was executed")
         elif rec.status in ("EXECUTED", "SKIPPED_ALREADY_HEALTHY"):
-            inc.attempts += 1                 # a skipped cycle also consumes budget, so retries stay bounded
+            inc.attempts += 1
             self._verify_since[inc.id] = now
             self._verify_samples[inc.id] = []
             inc.transition(S.VERIFYING, now, f"action {rec.status}; verifying (not yet resolved)")
@@ -144,7 +203,7 @@ class AutopilotEngine:
 
     def _verify(self, inc: Incident, spec: WorkloadSpec, now: float) -> None:
         sample = self.last_samples[spec.id]
-        if sample.ts > self._verify_since[inc.id]:       # ignore samples taken before the action
+        if sample.ts > self._verify_since[inc.id]:
             self._verify_samples[inc.id].append(sample)
         res = self.verifier.evaluate(spec, self._verify_samples[inc.id], now)
         inc.verification = res.to_dict()
@@ -199,12 +258,14 @@ class AutopilotEngine:
             out = []
             for spec in self.specs.values():
                 s = self.last_samples.get(spec.id)
-                out.append({"id": spec.id, "store_id": spec.store_id, "kind": spec.kind,
-                            "criticality": spec.criticality.value, "provenance": self.orch.provenance.value,
-                            "orchestrator": self.orch.name, "monitoring_error": self.monitoring_errors.get(spec.id),
-                            "suppressed_by_escalated_incident": self._blocked.get(spec.id),
-                            "status": asdict(s.status) if s else None,
-                            "health_probe": asdict(s.health) if s and s.health else None})
+                out.append({
+                    "id": spec.id, "store_id": spec.store_id, "kind": spec.kind,
+                    "criticality": spec.criticality.value, "provenance": self.orch.provenance.value,
+                    "orchestrator": self.orch.name, "monitoring_error": self.monitoring_errors.get(spec.id),
+                    "suppressed_by_escalated_incident": self._blocked.get(spec.id),
+                    "status": asdict(s.status) if s else None,
+                    "health_probe": asdict(s.health) if s and s.health else None,
+                })
             return out
 
     def incidents_view(self) -> list[dict[str, Any]]:
@@ -214,3 +275,46 @@ class AutopilotEngine:
     def incident_view(self, incident_id: str) -> dict[str, Any]:
         with self._lock:
             return asdict(self._get(incident_id))
+
+    # Phase 2: store-level aggregation
+    def stores_view(self) -> list[dict[str, Any]]:
+        """Aggregate workload and incident data by store."""
+        with self._lock:
+            stores: dict[str, dict[str, Any]] = {}
+            for spec in self.specs.values():
+                if spec.store_id not in stores:
+                    stores[spec.store_id] = {
+                        "store_id": spec.store_id,
+                        "workloads": [],
+                        "open_incidents": 0,
+                        "escalated_incidents": 0,
+                        "sync_pending": self._sync_pending.get(spec.store_id, 0),
+                        "provenance": self.orch.provenance.value,
+                    }
+                s = self.last_samples.get(spec.id)
+                stores[spec.store_id]["workloads"].append({
+                    "id": spec.id, "kind": spec.kind, "criticality": spec.criticality.value,
+                    "running": s.status.running if s else None,
+                    "health_ok": s.health.ok if s and s.health else None,
+                    "cpu_pct": s.status.cpu_pct if s else None,
+                    "mem_pct": s.status.mem_pct if s else None,
+                    "restart_count": s.status.restart_count if s else 0,
+                    "open_incident": self._open_for(spec.id) is not None,
+                })
+            # Count incidents per store
+            for inc in self.incidents.values():
+                if inc.store_id in stores and inc.is_open:
+                    stores[inc.store_id]["open_incidents"] += 1
+                if inc.store_id in stores and inc.state == S.ESCALATED:
+                    stores[inc.store_id]["escalated_incidents"] += 1
+            return list(stores.values())
+
+    def store_view(self, store_id: str) -> dict[str, Any]:
+        with self._lock:
+            stores = {s["store_id"]: s for s in self.stores_view()}
+            if store_id not in stores:
+                raise EngineError(f"store '{store_id}' not found", code="not_found")
+            view = stores[store_id]
+            view["incidents"] = [asdict(i) for i in self.incidents.values()
+                                 if i.store_id == store_id]
+            return view

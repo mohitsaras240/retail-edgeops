@@ -1,16 +1,125 @@
-# Phase 1: one simulated store with one PoS service (real container, simulated retail data).
-# restart: "no" is deliberate -- recovery must come from the autopilot, not Docker's restart policy.
 services:
+  # Store 001
   pos-store-001:
     build: ./workloads/pos_simulator
     container_name: rea-store001-pos
     environment:
       STORE_ID: store-001
-      ENABLE_FAULT_ENDPOINTS: "1"      # demo only: allows /_fault/degrade
+      ENABLE_FAULT_ENDPOINTS: "1"
     ports:
       - "127.0.0.1:18081:8080"
     volumes:
       - pos_store001_data:/data
     restart: "no"
+
+  kiosk-store-001:
+    build: ./workloads/kiosk_simulator
+    container_name: rea-store001-kiosk
+    environment:
+      STORE_ID: store-001
+      KIOSK_ID: kiosk-001
+      ENABLE_FAULT_ENDPOINTS: "1"
+    ports:
+      - "127.0.0.1:18082:8080"
+    volumes:
+      - kiosk_store001_data:/data
+    restart: "no"
+
+  sync-store-001:
+    build: ./workloads/transaction_sync
+    container_name: rea-store001-sync
+    environment:
+      STORE_ID: store-001
+      CENTRAL_URL: http://host.docker.internal:8000/central/ingest
+      ENABLE_FAULT_ENDPOINTS: "1"
+    ports:
+      - "127.0.0.1:18083:8080"
+    volumes:
+      - pos_store001_data:/data
+    restart: "no"
+
+  # Store 002
+  pos-store-002:
+    build: ./workloads/pos_simulator
+    container_name: rea-store002-pos
+    environment:
+      STORE_ID: store-002
+      ENABLE_FAULT_ENDPOINTS: "1"
+    ports:
+      - "127.0.0.1:18084:8080"
+    volumes:
+      - pos_store002_data:/data
+    restart: "no"
+
+  kiosk-store-002:
+    build: ./workloads/kiosk_simulator
+    container_name: rea-store002-kiosk
+    environment:
+      STORE_ID: store-002
+      KIOSK_ID: kiosk-002
+      ENABLE_FAULT_ENDPOINTS: "1"
+    ports:
+      - "127.0.0.1:18085:8080"
+    volumes:
+      - kiosk_store002_data:/data
+    restart: "no"
+
+  sync-store-002:
+    build: ./workloads/transaction_sync
+    container_name: rea-store002-sync
+    environment:
+      STORE_ID: store-002
+      CENTRAL_URL: http://host.docker.internal:8000/central/ingest
+      ENABLE_FAULT_ENDPOINTS: "1"
+    ports:
+      - "127.0.0.1:18086:8080"
+    volumes:
+      - pos_store002_data:/data
+    restart: "no"
+
+  # Store 003
+  pos-store-003:
+    build: ./workloads/pos_simulator
+    container_name: rea-store003-pos
+    environment:
+      STORE_ID: store-003
+      ENABLE_FAULT_ENDPOINTS: "1"
+    ports:
+      - "127.0.0.1:18087:8080"
+    volumes:
+      - pos_store003_data:/data
+    restart: "no"
+
+  kiosk-store-003:
+    build: ./workloads/kiosk_simulator
+    container_name: rea-store003-kiosk
+    environment:
+      STORE_ID: store-003
+      KIOSK_ID: kiosk-003
+      ENABLE_FAULT_ENDPOINTS: "1"
+    ports:
+      - "127.0.0.1:18088:8080"
+    volumes:
+      - kiosk_store003_data:/data
+    restart: "no"
+
+  sync-store-003:
+    build: ./workloads/transaction_sync
+    container_name: rea-store003-sync
+    environment:
+      STORE_ID: store-003
+      CENTRAL_URL: http://host.docker.internal:8000/central/ingest
+      ENABLE_FAULT_ENDPOINTS: "1"
+    ports:
+      - "127.0.0.1:18089:8080"
+    volumes:
+      - pos_store003_data:/data
+    restart: "no"
+
 volumes:
   pos_store001_data:
+  kiosk_store001_data:
+  pos_store002_data:
+  kiosk_store002_data:
+  pos_store003_data:
+  kiosk_store003_data:

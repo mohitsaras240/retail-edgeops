@@ -8,6 +8,78 @@
       "health_url": "http://127.0.0.1:18081/health",
       "transaction_url": "http://127.0.0.1:18081/transaction",
       "stateless": true
+    },
+    {
+      "id": "rea-store001-kiosk",
+      "store_id": "store-001",
+      "kind": "kiosk",
+      "criticality": "important",
+      "health_url": "http://127.0.0.1:18082/health",
+      "transaction_url": "http://127.0.0.1:18082/transaction",
+      "stateless": true
+    },
+    {
+      "id": "rea-store001-sync",
+      "store_id": "store-001",
+      "kind": "sync",
+      "criticality": "deferrable",
+      "health_url": "http://127.0.0.1:18083/health",
+      "transaction_url": "http://127.0.0.1:18083/stats",
+      "stateless": true
+    },
+    {
+      "id": "rea-store002-pos",
+      "store_id": "store-002",
+      "kind": "pos",
+      "criticality": "critical",
+      "health_url": "http://127.0.0.1:18084/health",
+      "transaction_url": "http://127.0.0.1:18084/transaction",
+      "stateless": true
+    },
+    {
+      "id": "rea-store002-kiosk",
+      "store_id": "store-002",
+      "kind": "kiosk",
+      "criticality": "important",
+      "health_url": "http://127.0.0.1:18085/health",
+      "transaction_url": "http://127.0.0.1:18085/transaction",
+      "stateless": true
+    },
+    {
+      "id": "rea-store002-sync",
+      "store_id": "store-002",
+      "kind": "sync",
+      "criticality": "deferrable",
+      "health_url": "http://127.0.0.1:18086/health",
+      "transaction_url": "http://127.0.0.1:18086/stats",
+      "stateless": true
+    },
+    {
+      "id": "rea-store003-pos",
+      "store_id": "store-003",
+      "kind": "pos",
+      "criticality": "critical",
+      "health_url": "http://127.0.0.1:18087/health",
+      "transaction_url": "http://127.0.0.1:18087/transaction",
+      "stateless": true
+    },
+    {
+      "id": "rea-store003-kiosk",
+      "store_id": "store-003",
+      "kind": "kiosk",
+      "criticality": "important",
+      "health_url": "http://127.0.0.1:18088/health",
+      "transaction_url": "http://127.0.0.1:18088/transaction",
+      "stateless": true
+    },
+    {
+      "id": "rea-store003-sync",
+      "store_id": "store-003",
+      "kind": "sync",
+      "criticality": "deferrable",
+      "health_url": "http://127.0.0.1:18089/health",
+      "transaction_url": "http://127.0.0.1:18089/stats",
+      "stateless": true
     }
   ]
 }
