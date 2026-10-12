@@ -1,0 +1,5 @@
+# Lower bounds only: versions were NOT verified in the authoring sandbox (no network).
+# After installing, run `pip freeze > requirements.lock` and commit it to pin.
+fastapi>=0.115
+uvicorn>=0.30
+pydantic>=2.7

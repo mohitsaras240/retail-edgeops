@@ -1,0 +1,13 @@
+{
+  "workloads": [
+    {
+      "id": "rea-store001-pos",
+      "store_id": "store-001",
+      "kind": "pos",
+      "criticality": "critical",
+      "health_url": "http://127.0.0.1:18081/health",
+      "transaction_url": "http://127.0.0.1:18081/transaction",
+      "stateless": true
+    }
+  ]
+}
