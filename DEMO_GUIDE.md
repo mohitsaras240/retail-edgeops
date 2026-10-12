@@ -28,9 +28,11 @@ The CLI demo runner executes all 6 core scenarios with formatted progress output
 ### Step 1: Start Backend and Frontend
 **Terminal 1 (Backend Engine):**
 ```powershell
+$env:AUTOPILOT_ORCHESTRATOR = "iofog"
+$env:IOFOG_CONTROLLER_URL = "http://localhost:54321"   # Your ioFog controller URL
+$env:IOFOG_AUTH_TOKEN = "your-iofog-user-or-api-token"  # Optional auth token
 cd d:\retail-edge-autopilot-phase1\retail-edge-autopilot\backend
-$env:AUTOPILOT_API_KEY = "kkkkkkkkkkkkkkkkkkkk"
-..\.venv\Scripts\python -m uvicorn app.api.routes:build_app --factory --port 8000 --host 127.0.0.1
+D:\retail-edge-autopilot-phase1\retail-edge-autopilot\.venv\Scripts\python -m uvicorn app.api.routes:build_app --factory --port 8000 --host 127.0.0.1
 ```
 
 **Terminal 2 (Web Dashboard):**
